@@ -1,0 +1,261 @@
+name: Build FixLag
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      # ---------- JAR 1: All-in-One (bundles Sodium, Lithium, ...) ----------
+      - name: Build FixLag All-in-One
+        run: |
+          set -euo pipefail
+          mkdir -p pack/META-INF/jars
+          cd pack
+          UA="fixlag-aio-builder/1.0 (github actions)"
+
+          for entry in fabric-api:1 sodium:1 lithium:0 ferrite-core:0 modernfix:0 immediatelyfast:0 entityculling:0 scalablelux:0 krypton:0 bobby:0 badoptimizations:0; do
+            slug="${entry%%:*}"
+            required="${entry##*:}"
+            url=$(curl -fsS -A "$UA" -G "https://api.modrinth.com/v2/project/$slug/version" \
+              --data-urlencode 'loaders=["fabric"]' \
+              --data-urlencode 'game_versions=["1.21.11"]' \
+              | jq -r 'map(select(.version_type=="release")) as $r
+                       | (if ($r|length) > 0 then $r else . end)[0]
+                       | (.files // []) | (map(select(.primary==true))[0] // .[0]) | .url // empty')
+            if [ -z "$url" ]; then
+              if [ "$required" = "1" ]; then
+                echo "::error::No Fabric 1.21.11 build found for required mod $slug"
+                exit 1
+              fi
+              echo "::warning::No Fabric 1.21.11 build for $slug, skipped"
+              continue
+            fi
+            echo "$slug -> $url"
+            curl -fsSL -A "$UA" -o "META-INF/jars/$slug.jar" "$url"
+          done
+
+          jars=$(ls META-INF/jars/*.jar | jq -R '{file: .}' | jq -s .)
+          jq -n --argjson jars "$jars" '{
+            schemaVersion: 1,
+            id: "fixlag_aio",
+            version: "1.4.0",
+            name: "FixLag All-in-One",
+            description: "Bundles performance and chunk-loading mods for Minecraft 1.21.11. Does not change game settings.",
+            environment: "client",
+            depends: { fabricloader: ">=0.16.0", minecraft: "~1.21.11" },
+            jars: $jars
+          }' > fabric.mod.json
+
+          zip -r ../fixlag-aio-1.4.0.jar fabric.mod.json META-INF
+          cd ..
+          unzip -l fixlag-aio-1.4.0.jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixlag-aio
+          path: fixlag-aio-1.4.0.jar
+
+      # ---------- JAR 2: Core (own optimizations, crash-safe mixins) ----------
+      - name: Build FixLag Core
+        id: core
+        continue-on-error: true
+        run: |
+          mkdir -p core/src/main/java/com/khang/fixlagcore/mixin core/src/main/resources
+          cd core
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'fixlag-core'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = '1.0.0'
+          group = 'com.khang'
+
+          base {
+              archivesName = 'fixlag-core'
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:1.21.11"
+              mappings "net.fabricmc:yarn:1.21.11+build.4:v2"
+              modImplementation "net.fabricmc:fabric-loader:0.18.4"
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "fixlag_core",
+            "version": "1.0.0",
+            "name": "FixLag Core",
+            "description": "Cuts far-away particles and entity rendering. Does not change game settings.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.khang.fixlagcore.FixLagCoreClient"]
+            },
+            "mixins": ["fixlagcore.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/fixlagcore.mixins.json <<'EOF'
+          {
+            "required": false,
+            "package": "com.khang.fixlagcore.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["ParticleManagerMixin", "EntityRenderDispatcherMixin"],
+            "injectors": { "defaultRequire": 0 }
+          }
+          EOF
+
+          cat > src/main/java/com/khang/fixlagcore/FixLagCoreClient.java <<'EOF'
+          package com.khang.fixlagcore;
+
+          import net.fabricmc.api.ClientModInitializer;
+
+          public class FixLagCoreClient implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  try {
+                      Thread.currentThread().setPriority(Thread.MAX_PRIORITY);
+                  } catch (Throwable ignored) {
+                  }
+                  System.out.println("[FixLagCore] loaded");
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/khang/fixlagcore/FixLagCore.java <<'EOF'
+          package com.khang.fixlagcore;
+
+          import net.minecraft.client.MinecraftClient;
+
+          public final class FixLagCore {
+              private static long windowStart = 0;
+              private static int count = 0;
+
+              private FixLagCore() {}
+
+              /** True if this particle should be dropped (too far, or too many in a short time). */
+              public static boolean dropParticle(double x, double y, double z) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.player != null && mc.player.squaredDistanceTo(x, y, z) > 576.0) {
+                      return true;
+                  }
+                  long now = System.nanoTime();
+                  if (now - windowStart > 100_000_000L) {
+                      windowStart = now;
+                      count = 0;
+                  }
+                  return ++count > 400;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/khang/fixlagcore/mixin/ParticleManagerMixin.java <<'EOF'
+          package com.khang.fixlagcore.mixin;
+
+          import com.khang.fixlagcore.FixLagCore;
+          import net.minecraft.client.particle.Particle;
+          import net.minecraft.client.particle.ParticleManager;
+          import net.minecraft.particle.ParticleEffect;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(ParticleManager.class)
+          public class ParticleManagerMixin {
+              @Inject(
+                  method = "addParticle(Lnet/minecraft/particle/ParticleEffect;DDDDDD)Lnet/minecraft/client/particle/Particle;",
+                  at = @At("HEAD"),
+                  cancellable = true,
+                  require = 0
+              )
+              private void fixlagcore$limit(ParticleEffect effect, double x, double y, double z,
+                                            double vx, double vy, double vz,
+                                            CallbackInfoReturnable<Particle> cir) {
+                  if (FixLagCore.dropParticle(x, y, z)) {
+                      cir.setReturnValue(null);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/khang/fixlagcore/mixin/EntityRenderDispatcherMixin.java <<'EOF'
+          package com.khang.fixlagcore.mixin;
+
+          import net.minecraft.client.render.Frustum;
+          import net.minecraft.client.render.entity.EntityRenderDispatcher;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.ExperienceOrbEntity;
+          import net.minecraft.entity.ItemEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(EntityRenderDispatcher.class)
+          public class EntityRenderDispatcherMixin {
+              @Inject(method = "shouldRender", at = @At("HEAD"), cancellable = true, require = 0)
+              private <E extends Entity> void fixlagcore$cull(E entity, Frustum frustum,
+                                                              double x, double y, double z,
+                                                              CallbackInfoReturnable<Boolean> cir) {
+                  if (entity instanceof PlayerEntity) return;
+                  if (entity.getWidth() > 3.0f) return;
+                  double d = entity.squaredDistanceTo(x, y, z);
+                  double limit = (entity instanceof ItemEntity || entity instanceof ExperienceOrbEntity)
+                          ? 576.0
+                          : 2304.0;
+                  if (d > limit) {
+                      cir.setReturnValue(Boolean.FALSE);
+                  }
+              }
+          }
+          EOF
+
+          gradle build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixlag-core
+          path: core/build/libs/fixlag-core-1.0.0.jar
+          if-no-files-found: warn
